@@ -67,6 +67,22 @@ describe("refresh-lock", () => {
     held!.release()
   })
 
+  it("does not remove a successor's lock when a stale holder releases", () => {
+    const original = acquireRefreshLock(SRC, { dir, ttlMs: 20_000 })
+    assert.ok(original)
+    const future = Date.now() + 60_000
+    const now = () => future
+    const successor = acquireRefreshLock(SRC, { dir, ttlMs: 20_000, now })
+    assert.ok(successor)
+    original.release()
+    // The successor's mtime is real time; check ownership without advancing
+    // the test clock a second time and making that new lock stale too.
+    assert.equal(acquireRefreshLock(SRC, { dir }), null)
+    original.release()
+    assert.equal(acquireRefreshLock(SRC, { dir }), null)
+    successor.release()
+  })
+
   it("keeps locks for different sources independent", () => {
     const a = acquireRefreshLock("source-a", { dir })
     const b = acquireRefreshLock("source-b", { dir })

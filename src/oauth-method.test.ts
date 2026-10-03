@@ -32,7 +32,6 @@ function makeDeps(overrides: Partial<OAuthDeps> = {}): OAuthDeps & {
   const calls: Record<string, unknown[]> = {
     setActiveAccountSource: [],
     saveAccountSource: [],
-    writeBackCredentials: [],
     log: [],
   }
   return {
@@ -46,13 +45,7 @@ function makeDeps(overrides: Partial<OAuthDeps> = {}): OAuthDeps & {
     saveAccountSource: (source) => {
       calls.saveAccountSource.push(source)
     },
-    reloadCredentialsFromSource: () => null,
-    readStoredCredentials: () => null,
-    refreshViaOAuth: async () => null,
-    writeBackCredentials: (source, creds, configDir, expected) => {
-      calls.writeBackCredentials.push([source, creds, configDir, expected])
-      return true
-    },
+    refreshCredential: async () => ({ kind: "terminal", status: 400 }),
     log: (event, data) => {
       calls.log.push([event, data])
     },
@@ -341,94 +334,35 @@ describe("refreshOAuthCredential", () => {
     metadata: { source: "acct", configDir: "/tmp/claude" },
   }
 
-  it("resyncs from the keychain instead of hitting the network when it disagrees", async () => {
-    let refreshViaOAuthCalled = false
+  const refreshed = {
+    accessToken: "refreshed-access",
+    refreshToken: "refreshed-refresh",
+    expiresAt: 333,
+  }
+
+  it("delegates refresh to the coordinator with the credential's explicit source", async () => {
     const deps = makeDeps({
-      reloadCredentialsFromSource: () => ({
-        accessToken: "fresh-access",
-        refreshToken: "fresh-refresh",
-        expiresAt: 999,
-      }),
-      refreshViaOAuth: async () => {
-        refreshViaOAuthCalled = true
-        return null
+      refreshCredential: async (request) => {
+        assert.equal(request.source, "acct")
+        assert.equal(request.configDir, "/tmp/claude")
+        assert.equal(request.credentials.refreshToken, "old-refresh")
+        assert.equal(request.credentials.expiresAt, 222)
+        assert.equal(request.thresholdMs, 300_000)
+        return { kind: "ok", creds: refreshed }
       },
     })
-    const result = await refreshOAuthCredential(value, deps)
-    assert.equal(result.access, "fresh-access")
-    assert.equal(result.refresh, "fresh-refresh")
-    assert.equal(result.expires, 999)
-    assert.equal(refreshViaOAuthCalled, false)
-    assert.deepEqual(deps.calls.log[0], [
-      "refresh_resynced_from_keychain",
-      { source: "acct" },
-    ])
-  })
-
-  it("uses the stored refresh token even when the stored access token has expired", async () => {
-    let tokenUsed: string | undefined
-    const deps = makeDeps({
-      reloadCredentialsFromSource: () => null,
-      readStoredCredentials: (source, configDir) => {
-        assert.equal(source, "acct")
-        assert.equal(configDir, "/tmp/claude")
-        return {
-          accessToken: "expired-stored-access",
-          refreshToken: "rotated-stored-refresh",
-          expiresAt: 0,
-        }
-      },
-      refreshViaOAuth: async (token) => {
-        tokenUsed = token
-        return {
-          accessToken: "refreshed-access",
-          refreshToken: "refreshed-refresh",
-          expiresAt: 333,
-        }
-      },
-    })
-
-    const result = await refreshOAuthCredential(value, deps)
-
-    assert.equal(tokenUsed, "rotated-stored-refresh")
-    assert.equal(result.refresh, "refreshed-refresh")
-    assert.equal(
-      deps.calls.writeBackCredentials[0]?.[3],
-      "expired-stored-access",
+    const result = await refreshOAuthCredential(
+      { ...value, expires: 222 },
+      deps,
     )
-  })
-
-  it("falls back to OpenCode's refresh token when the store read throws", async () => {
-    let tokenUsed: string | undefined
-    const deps = makeDeps({
-      reloadCredentialsFromSource: () => null,
-      readStoredCredentials: () => {
-        throw new Error("keychain locked")
-      },
-      refreshViaOAuth: async (token) => {
-        tokenUsed = token
-        return {
-          accessToken: "refreshed-access",
-          refreshToken: "refreshed-refresh",
-          expiresAt: 333,
-        }
-      },
-    })
-
-    await refreshOAuthCredential(value, deps)
-
-    assert.equal(tokenUsed, "old-refresh")
-    assert.equal(deps.calls.writeBackCredentials[0]?.[3], "old-access")
+    assert.equal(result.access, refreshed.accessToken)
+    assert.equal(result.refresh, refreshed.refreshToken)
+    assert.equal(result.expires, refreshed.expiresAt)
   })
 
   it("preserves the Claude Code OAuth marker across refresh", async () => {
     const deps = makeDeps({
-      reloadCredentialsFromSource: () => null,
-      refreshViaOAuth: async () => ({
-        accessToken: "refreshed-access",
-        refreshToken: "refreshed-refresh",
-        expiresAt: 111,
-      }),
+      refreshCredential: async () => ({ kind: "ok", creds: refreshed }),
     })
     const result = await refreshOAuthCredential(
       {
@@ -446,40 +380,9 @@ describe("refreshOAuthCredential", () => {
     )
   })
 
-  it("falls through to a network refresh when the keychain is unavailable", async () => {
+  it("requires login only when the coordinator reports a terminal failure", async () => {
     const deps = makeDeps({
-      reloadCredentialsFromSource: () => null,
-      refreshViaOAuth: async () => ({
-        accessToken: "refreshed-access",
-        refreshToken: "refreshed-refresh",
-        expiresAt: 111,
-      }),
-    })
-    const result = await refreshOAuthCredential(value, deps)
-    assert.equal(result.access, "refreshed-access")
-  })
-
-  it("falls through to a network refresh when the keychain agrees with what we have", async () => {
-    const deps = makeDeps({
-      reloadCredentialsFromSource: () => ({
-        accessToken: "old-access",
-        refreshToken: "old-refresh",
-        expiresAt: 1,
-      }),
-      refreshViaOAuth: async () => ({
-        accessToken: "refreshed-access",
-        refreshToken: "refreshed-refresh",
-        expiresAt: 222,
-      }),
-    })
-    const result = await refreshOAuthCredential(value, deps)
-    assert.equal(result.access, "refreshed-access")
-  })
-
-  it("throws a clear error when the network refresh fails", async () => {
-    const deps = makeDeps({
-      reloadCredentialsFromSource: () => null,
-      refreshViaOAuth: async () => null,
+      refreshCredential: async () => ({ kind: "terminal", status: 400 }),
     })
     await assert.rejects(
       () => refreshOAuthCredential(value, deps),
@@ -487,57 +390,43 @@ describe("refreshOAuthCredential", () => {
     )
   })
 
-  it("writes back credentials after a successful network refresh", async () => {
+  it("does not tell the user to log in after a transient failure", async () => {
     const deps = makeDeps({
-      reloadCredentialsFromSource: () => null,
-      refreshViaOAuth: async () => ({
-        accessToken: "refreshed-access",
-        refreshToken: "refreshed-refresh",
-        expiresAt: 333,
-      }),
+      refreshCredential: async () => ({ kind: "transient", status: 503 }),
     })
-    await refreshOAuthCredential(value, deps)
-    assert.equal(deps.calls.writeBackCredentials.length, 1)
-    assert.deepEqual(deps.calls.writeBackCredentials[0], [
-      "acct",
-      {
-        accessToken: "refreshed-access",
-        refreshToken: "refreshed-refresh",
-        expiresAt: 333,
+    await assert.rejects(
+      () => refreshOAuthCredential(value, deps),
+      (error: Error) => {
+        assert.match(error.message, /temporarily unavailable/)
+        assert.doesNotMatch(error.message, /Run `claude`/)
+        return true
       },
-      "/tmp/claude",
-      "old-access",
-    ])
+    )
   })
 
-  it("does not write back credentials when there is no source in metadata", async () => {
+  it("supports credentials without source metadata", async () => {
     const deps = makeDeps({
-      reloadCredentialsFromSource: () => null,
-      refreshViaOAuth: async () => ({
-        accessToken: "refreshed-access",
-        refreshToken: "refreshed-refresh",
-        expiresAt: 333,
-      }),
+      refreshCredential: async (request) => {
+        assert.equal(request.source, undefined)
+        return { kind: "ok", creds: refreshed }
+      },
     })
     await refreshOAuthCredential(
       { type: "oauth" as const, access: "a", refresh: "r" },
       deps,
     )
-    assert.equal(deps.calls.writeBackCredentials.length, 0)
   })
 
-  it("marks the account active before checking the keychain, only when a source is present", async () => {
+  it("does not change the active account while refreshing a connection", async () => {
     const successfulRefresh = {
-      reloadCredentialsFromSource: () => null,
-      refreshViaOAuth: async () => ({
-        accessToken: "refreshed-access",
-        refreshToken: "refreshed-refresh",
-        expiresAt: 999,
+      refreshCredential: async () => ({
+        kind: "ok" as const,
+        creds: refreshed,
       }),
     }
     const deps = makeDeps(successfulRefresh)
     await refreshOAuthCredential(value, deps)
-    assert.deepEqual(deps.calls.setActiveAccountSource, ["acct"])
+    assert.deepEqual(deps.calls.setActiveAccountSource, [])
 
     const depsNoSource = makeDeps(successfulRefresh)
     await refreshOAuthCredential(

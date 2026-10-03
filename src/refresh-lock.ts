@@ -6,7 +6,8 @@
  * bury the endpoint in duplicate requests — the token endpoint answers the pile
  * with HTTP 429. An advisory lock file lets exactly one refresher proceed; the
  * others wait briefly and adopt the winner's freshly written token from the
- * shared credential store.
+ * shared credential store. The unmodified Claude CLI does not use this lock;
+ * source rereads handle its independent rotations.
  *
  * "Best-effort" is deliberate: any filesystem error degrades to running the
  * refresh without a lock rather than blocking it. A crashed holder cannot
@@ -15,6 +16,7 @@
  */
 import {
   closeSync,
+  fstatSync,
   mkdirSync,
   openSync,
   statSync,
@@ -30,7 +32,9 @@ import { log } from "./logger.ts"
 export const DEFAULT_LOCK_TTL_MS = (() => {
   const raw = process.env.OPENCODE_CLAUDE_AUTH_REFRESH_LOCK_TTL_MS
   const parsed = raw ? Number.parseInt(raw, 10) : NaN
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 20_000
+  // A held attempt may exchange two source generations (15s each), plus
+  // credential I/O. Allow it to finish before declaring the holder stale.
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 60_000
 })()
 
 export interface RefreshLock {
@@ -88,7 +92,7 @@ export function acquireRefreshLock(
   for (let attempt = 0; attempt < 2; attempt++) {
     let fd: number
     try {
-      fd = openSync(path, "wx")
+      fd = openSync(path, "wx", 0o600)
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code
       if (code !== "EEXIST") {
@@ -122,17 +126,25 @@ export function acquireRefreshLock(
       // The lock is held regardless of whether the payload wrote.
     }
     log("refresh_lock_acquired", { source })
+    const owner = fstatSync(fd)
+    let released = false
     return {
       release() {
+        if (released) return
+        released = true
+        try {
+          const current = statSync(path)
+          // A stale takeover may have replaced this path. Never unlink the
+          // successor's lock when the original refresh eventually finishes.
+          if (current.dev === owner.dev && current.ino === owner.ino)
+            unlinkSync(path)
+        } catch {
+          // already gone
+        }
         try {
           closeSync(fd)
         } catch {
           // already closed
-        }
-        try {
-          unlinkSync(path)
-        } catch {
-          // already gone (e.g. a stale-takeover removed it)
         }
       },
     }

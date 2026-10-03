@@ -125,6 +125,14 @@ async function loadCredentialsWithCountingKeychain(
     await readFile(new URL("./refresh-lock.ts", import.meta.url), "utf8"),
     "utf8",
   )
+  await writeFile(
+    join(tempDir, "refresh-coordinator.ts"),
+    await readFile(
+      new URL("./refresh-coordinator.ts", import.meta.url),
+      "utf8",
+    ),
+    "utf8",
+  )
   const rewritten = sourceCredentials
     .replace(/from\s+["']\.\/(\w+)\.js["']/g, 'from "./$1.ts"')
     .replace(
@@ -832,16 +840,18 @@ describe("credential caching", () => {
         },
       )
 
-      const readsBefore = keychainModule.__getReadCount()
+      const readsBefore = keychainModule.__getReads().length
       const result = await credentialsModule.refreshIfNeeded()
 
       assert.equal(result?.accessToken, "fresh-in-memory")
       // The fallback account is still borrowed straight from memory rather
       // than re-read.
-      assert.equal(
-        keychainModule.__getReadCount(),
-        readsBefore + 2,
-        "one up-front re-read of the target's own source, one after the failed OAuth refresh",
+      assert.ok(
+        keychainModule
+          .__getReads()
+          .slice(readsBefore)
+          .every((read) => read.source === "Claude Code-credentials-aabbccdd"),
+        "only the failed account is read; the lender is borrowed from memory",
       )
     } finally {
       Date.now = originalNow
@@ -965,6 +975,7 @@ describe("credential caching", () => {
       refreshToken: "new-refresh",
       expiresAt: now + 10 * 60_000,
     }
+    keychainModule.__setCredentials(account.credentials)
     const seenRefreshTokens: string[] = []
     const writesBefore = keychainModule.__getWriteCount()
 
@@ -1013,6 +1024,7 @@ describe("credential caching", () => {
     credentialsModule.initAccounts([account])
 
     const writesBefore = keychainModule.__getWrites().length
+    keychainModule.__setCredentials(account.credentials)
 
     await credentialsModule.forceRefreshActiveAccount(async () => ({
       accessToken: "oauth-refreshed",
@@ -1033,9 +1045,8 @@ describe("credential caching", () => {
 
   it("forceRefreshActiveAccount returns null and leaves the account untouched on failure", async () => {
     const now = Date.now()
-    const { credentialsModule } = await loadCredentialsWithCountingKeychain(
-      now + 10 * 60_000,
-    )
+    const { credentialsModule, keychainModule } =
+      await loadCredentialsWithCountingKeychain(now + 10 * 60_000)
 
     const account = {
       label: "Account 1",
@@ -1048,6 +1059,7 @@ describe("credential caching", () => {
     }
     credentialsModule.initAccounts([account])
 
+    keychainModule.__setCredentials(account.credentials)
     const result = await credentialsModule.forceRefreshActiveAccount(() => null)
 
     assert.equal(result, null)
@@ -1467,6 +1479,14 @@ describe("syncAuthJson file permissions", () => {
         await readFile(new URL("./refresh-lock.ts", import.meta.url), "utf8"),
         "utf8",
       )
+      await writeFile(
+        join(tempDir, "refresh-coordinator.ts"),
+        await readFile(
+          new URL("./refresh-coordinator.ts", import.meta.url),
+          "utf8",
+        ),
+        "utf8",
+      )
       const rewritten = sourceCredentials.replace(
         /from\s+["']\.\/(\w+)\.js["']/g,
         'from "./$1.ts"',
@@ -1568,6 +1588,14 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
       await writeFile(
         join(tempDir, "refresh-lock.ts"),
         await readFile(new URL("./refresh-lock.ts", import.meta.url), "utf8"),
+        "utf8",
+      )
+      await writeFile(
+        join(tempDir, "refresh-coordinator.ts"),
+        await readFile(
+          new URL("./refresh-coordinator.ts", import.meta.url),
+          "utf8",
+        ),
         "utf8",
       )
       const rewritten = sourceCredentials.replace(
@@ -2135,20 +2163,15 @@ describe("refreshIfNeeded CLI fallback scope", () => {
       const target = makeAccount(now + 30_000)
       credentialsModule.initAccounts([target])
 
-      // The store initially matches memory, so neither the up-front re-read
-      // nor the pre-CLI re-read finds anything new. Only once the CLI has run
-      // does the entry rotate — hence the third read, not the second:
-      // 1) refreshIfNeeded's up-front re-read, 2) the re-read after OAuth
-      // fails, 3) the read after the CLI has rotated the entry.
+      // The store matches memory until the fake CLI actually runs. Counting
+      // source reads would couple this scenario to the coordinator's rereads.
       keychainModule.__setCredentials({
         accessToken: "existing-token",
         refreshToken: "existing-refresh",
         expiresAt: now + 30_000,
       })
-      let reads = 0
       keychainModule.__setReadHook(() => {
-        reads += 1
-        if (reads >= 3) {
+        if (childProcessModule.__getExecSyncCount() > 0) {
           keychainModule.__setCredentials({
             accessToken: "cli-rotated-token",
             refreshToken: "cli-rotated-refresh",
@@ -2279,7 +2302,8 @@ describe("borrowed fallback credentials", () => {
     const originalFetch = globalThis.fetch
     const originalNow = Date.now
     const now = 1_700_000_000_000
-    Date.now = () => now
+    let clock = now
+    Date.now = () => clock
 
     let oauthFails = true
     globalThis.fetch = (async () => {
@@ -2337,6 +2361,9 @@ describe("borrowed fallback credentials", () => {
 
       const writesBefore = keychainModule.__getWrites().length
       oauthFails = false
+      // Borrowed recovery now respects the same transient cooldown as all
+      // other refresh paths instead of bypassing it.
+      clock += 61_000
 
       // A threshold wider than the borrowed credential's remaining life
       // forces a refresh while leaving it usable, so the up-front re-read

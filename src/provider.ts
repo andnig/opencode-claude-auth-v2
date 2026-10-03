@@ -164,11 +164,22 @@ async function sendRequest(request: Request, send: Fetch): Promise<Response> {
 }
 
 /** Handle subscription recovery after OpenCode sends the first HTTP request. */
+export interface AuthRecovery {
+  reload: typeof reloadCredentialsFromSource
+  refresh: typeof forceRefreshActiveAccount
+  failureKind: typeof getActiveRefreshFailureKind
+}
+
 export async function finishClaudeResponse(
   request: Request,
   initial: Response,
   source?: string,
   send: Fetch = fetch,
+  recovery: AuthRecovery = {
+    reload: reloadCredentialsFromSource,
+    refresh: forceRefreshActiveAccount,
+    failureKind: getActiveRefreshFailureKind,
+  },
 ): Promise<Response> {
   const modelID = modelFromBody(await request.clone().text())
   const account = resolveAccount(source)
@@ -201,11 +212,36 @@ export async function finishClaudeResponse(
   let response = initial
 
   for (let attempt = 0; response.status === 401 && attempt < 2; attempt++) {
-    let candidate: ClaudeCredentials | null =
-      reloadCredentialsFromSource(account)
+    let candidate: ClaudeCredentials | null = recovery.reload(account)
     if (!candidate || candidate.accessToken === token)
-      candidate = await forceRefreshActiveAccount(undefined, account)
-    if (!candidate || candidate.accessToken === token) break
+      candidate = await recovery.refresh(
+        undefined,
+        account,
+        token,
+        request.signal,
+      )
+    if (!candidate || candidate.accessToken === token) {
+      if (
+        recovery.failureKind(account) === "transient" &&
+        !request.signal.aborted
+      ) {
+        return new Response(
+          JSON.stringify({
+            type: "error",
+            error: {
+              type: "overloaded_error",
+              message:
+                "Claude token refresh is temporarily unavailable; retry shortly.",
+            },
+          }),
+          {
+            status: 503,
+            headers: { "content-type": "application/json", "retry-after": "5" },
+          },
+        )
+      }
+      break
+    }
     token = candidate.accessToken
     log("auth_recovery_retry", { modelID, attempt: attempt + 1 })
     response = await sendWithToken(token)

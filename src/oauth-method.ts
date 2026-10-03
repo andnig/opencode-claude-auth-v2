@@ -2,19 +2,15 @@ import { Credential, Integration } from "@opencode/plugin"
 import type { IntegrationOAuthMethod } from "@opencode/plugin/promise/integration"
 import {
   getCachedCredentials,
+  coordinateCredentialRefresh,
   loadPersistedAccountSource,
   refreshAccountsList,
-  refreshViaOAuth,
-  reloadCredentialsFromSource,
   saveAccountSource,
   setActiveAccountSource,
 } from "./credentials.ts"
-import {
-  refreshAccount,
-  writeBackCredentials,
-  type ClaudeAccount,
-  type ClaudeCredentials,
-} from "./keychain.ts"
+import type { RefreshOutcome } from "./credentials.ts"
+import type { RefreshRequest } from "./refresh-coordinator.ts"
+import type { ClaudeAccount, ClaudeCredentials } from "./keychain.ts"
 import { log } from "./logger.ts"
 
 export const INTEGRATION_ID: Integration.ID = Integration.ID.make("anthropic")
@@ -42,19 +38,7 @@ export interface OAuthDeps {
   getCachedCredentials: () => Promise<ClaudeCredentials | null>
   setActiveAccountSource: (source: string) => void
   saveAccountSource: (source: string) => void
-  reloadCredentialsFromSource: () => ClaudeCredentials | null
-  /** Raw read of the account's store, without the usable-expiry check. */
-  readStoredCredentials: (
-    source: string,
-    configDir: string | undefined,
-  ) => ClaudeCredentials | null
-  refreshViaOAuth: (refreshToken: string) => Promise<ClaudeCredentials | null>
-  writeBackCredentials: (
-    source: string,
-    creds: ClaudeCredentials,
-    configDir: string | undefined,
-    expectedPriorAccessToken: string,
-  ) => boolean
+  refreshCredential: (request: RefreshRequest) => Promise<RefreshOutcome>
   log: (event: string, data?: Record<string, unknown>) => void
 }
 
@@ -161,6 +145,7 @@ export interface RefreshableCredential {
   readonly type: "oauth"
   readonly access: string
   readonly refresh: string
+  readonly expires?: number
   readonly metadata?: Record<string, unknown>
 }
 
@@ -177,52 +162,27 @@ export async function refreshOAuthCredential(
       ? value.metadata.configDir
       : undefined
 
-  // OpenCode persists whatever this returns and replays that same value on
-  // every future refresh, forever, until we return something different. If
-  // `claude` has since rotated credentials independently of this connection
-  // (a fresh interactive login, its own periodic refresh, ...), the stored
-  // refresh token goes permanently stale and every refresh fails with
-  // invalid_grant even though a working credential is sitting in the
-  // keychain right now. The keychain is the real source of truth, so check
-  // it before ever attempting a network refresh with a token that may
-  // already be dead.
-  if (source) deps.setActiveAccountSource(source)
-  const fresh = deps.reloadCredentialsFromSource()
-  if (fresh && fresh.refreshToken !== value.refresh) {
-    deps.log("refresh_resynced_from_keychain", { source })
-    return Credential.OAuth.make({
-      ...value,
-      methodID: METHOD_ID,
-      access: fresh.accessToken,
-      refresh: fresh.refreshToken,
-      expires: fresh.expiresAt,
-    })
-  }
-
-  // The reload above rejects a store whose access token is about to expire,
-  // but its refresh token can still be newer than ours: after a sleep past
-  // expiry, `claude` may have rotated it while our copy is already dead.
-  // Refresh with the stored token and compare-and-swap against the stored
-  // access token so the store receives the rotation.
-  let stored: ClaudeCredentials | null = null
-  try {
-    if (source) stored = deps.readStoredCredentials(source, configDir)
-  } catch {
-    // A locked or denied keychain leaves our own token as the only candidate.
-  }
-  const current = stored?.refreshToken
-    ? stored
-    : { accessToken: value.access, refreshToken: value.refresh }
-  if (current.refreshToken !== value.refresh)
-    deps.log("refresh_using_stored_refresh_token", { source })
-
-  const refreshed = await deps.refreshViaOAuth(current.refreshToken)
-  if (!refreshed)
+  // Resolve the credential's own source, never mutate the global active account.
+  // OpenCode calls this five minutes before expiry, earlier than HTTP preflight.
+  const outcome = await deps.refreshCredential({
+    source,
+    configDir,
+    credentials: {
+      accessToken: value.access,
+      refreshToken: value.refresh,
+      expiresAt: value.expires ?? 0,
+    },
+    thresholdMs: 5 * 60_000,
+  })
+  if (outcome.kind === "transient")
+    throw new Error(
+      "Claude OAuth refresh is temporarily unavailable. Retry shortly; no new login is required.",
+    )
+  if (outcome.kind === "terminal")
     throw new Error(
       "Claude OAuth refresh failed. Run `claude` to re-authenticate.",
     )
-  if (source)
-    deps.writeBackCredentials(source, refreshed, configDir, current.accessToken)
+  const refreshed = outcome.creds
   return Credential.OAuth.make({
     ...value,
     methodID: METHOD_ID,
@@ -247,9 +207,6 @@ export const realOAuthDeps: OAuthDeps = {
   getCachedCredentials,
   setActiveAccountSource,
   saveAccountSource,
-  reloadCredentialsFromSource,
-  readStoredCredentials: refreshAccount,
-  refreshViaOAuth,
-  writeBackCredentials,
+  refreshCredential: coordinateCredentialRefresh,
   log,
 }
